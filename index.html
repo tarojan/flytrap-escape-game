@@ -603,10 +603,10 @@ function showToast(text, frames) {
   toast = { text, timer: frames };
 }
 
-// ダメージ共通処理：体力ゲージを1/3減らし、ゲージの震え演出＋画面赤フラッシュ＋ダメージ音を鳴らす
+// ダメージ共通処理：体力ゲージを減らし、ゲージの震え演出＋画面赤フラッシュ＋ダメージ音を鳴らす
 // （火炎ブレスの準備状態はここではリセットしない。ダメージを受けても発射権はキープされる）
-function takeDamage() {
-  stamina -= STAMINA_MAX * DAMAGE_STAMINA_RATIO;
+function takeDamage(ratio = DAMAGE_STAMINA_RATIO) {
+  stamina -= STAMINA_MAX * ratio;
   staminaHitT = performance.now();
   hitFlash = 1;
   playPainSound();
@@ -924,7 +924,9 @@ function eatInsect(obj) {
 
   const info = KIND_INFO[obj.type];
   if (!info.edible) {
-    takeDamage();
+    // 難易度調整：ハチ・コウモリに当たったときのダメージは半分にする
+    const isBeeOrBat = obj.type === 'bee' || obj.type === 'bat';
+    takeDamage(isBeeOrBat ? DAMAGE_STAMINA_RATIO / 2 : DAMAGE_STAMINA_RATIO);
     scheduleRespawn(obj, 1800);
     return;
   }
