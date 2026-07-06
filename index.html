@@ -1,0 +1,1597 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8">
+<title>ハエトリソウの脱出</title>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    background: #0c0a06;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    min-height: 100vh;
+  }
+  #debugStatus {
+    margin-top: 8px;
+    font: 11px sans-serif;
+    color: #7a6f55;
+    text-align: center;
+  }
+  #gameCanvas {
+    width: 1200px;
+    height: 720px;
+    border: 4px solid #8a6d2c;
+    border-radius: 8px;
+    box-shadow: 0 0 30px #8a6d2c66;
+    display: block;
+    cursor: crosshair;
+    image-rendering: pixelated;
+    image-rendering: -moz-crisp-edges;
+    image-rendering: crisp-edges;
+  }
+</style>
+</head>
+<body>
+<canvas id="gameCanvas" width="800" height="480"></canvas>
+<div id="debugStatus"></div>
+
+<script>
+const canvas = document.getElementById('gameCanvas');
+const ctx = canvas.getContext('2d');
+const W = canvas.width, H = canvas.height;
+
+// 画面外（キャンバス下）の小さなステータス表示。コントローラーとBGMの状態の切り分けに使う
+const debugStatusEl = document.getElementById('debugStatus');
+let lastDebugStatusText = '';
+function updateDebugStatus() {
+  if (!debugStatusEl) return;
+  let gpLabel;
+  if (gamepadError) gpLabel = `コントローラー: エラー（${gamepadError}）`;
+  else if (gamepadIndex !== null) gpLabel = 'コントローラー: 接続中';
+  else gpLabel = 'コントローラー: 未検出（ボタンを押すと認識されます）';
+  const bgmActive = !bgmAudio.paused || !bossBgmAudio.paused;
+  const bgmLabel = bgmActive ? 'BGM: 再生中' : 'BGM: 停止中（画面をクリックすると再生されます）';
+  const text = `${gpLabel}　｜　${bgmLabel}`;
+  if (text !== lastDebugStatusText) {
+    debugStatusEl.textContent = text;
+    lastDebugStatusText = text;
+  }
+}
+
+// ------- ドット絵風レンダリング用の低解像度バッファ -------
+const SCALE = 2;
+const IW = W / SCALE, IH = H / SCALE; // 400 x 240
+const buf = document.createElement('canvas');
+buf.width = IW; buf.height = IH;
+const bctx = buf.getContext('2d');
+bctx.imageSmoothingEnabled = false;
+ctx.imageSmoothingEnabled = false;
+
+const groundY = IH * 0.80;
+
+// ------- 背景画像（ステージごとに切り替え） -------
+// ステージは1〜3。最終ステージ(3)は、以前ステージ4で使っていた背景・敵数をそのまま使う
+// （旧ステージ3の背景は使わなくなったため読み込まない）
+const bgLoadedFlags = [false, false, false];
+function makeBgImage(src, idx) {
+  const im = new Image();
+  im.onload = () => { bgLoadedFlags[idx] = true; };
+  im.src = src;
+  return im;
+}
+const bgImg1 = makeBgImage('image/whoswho_tekken_pixel_art_game_background_inspired_by_a_retro__8a75b214-f0d4-426d-bbcb-bb2684abeb56_1.png', 0);
+const bgImg2 = makeBgImage('image/back_stage2.png', 1);
+const bgImg4 = makeBgImage('image/back_stage4.png', 2);
+const bgImgs = [bgImg1, bgImg2, bgImg4];
+// 背景画像のネイティブサイズとキャンバス比率が異なるため、中央を「カバー」表示するための切り出し範囲
+const BG_NATIVE = { w: 1456, h: 816 };
+const bgCropW = BG_NATIVE.h * (IW / IH);
+const bgCropX = (BG_NATIVE.w - bgCropW) / 2;
+
+// ------- 噛みつき効果音 -------
+const biteSound = new Audio('image/' + encodeURIComponent('ガブッ.mp3'));
+biteSound.preload = 'auto';
+function playBiteSound() {
+  biteSound.currentTime = 0;
+  biteSound.play().catch(() => {});
+}
+
+// ------- ダメージ効果音（いた1/いた2からランダム） -------
+const painSounds = [
+  new Audio('image/' + encodeURIComponent('いた1.mp3')),
+  new Audio('image/' + encodeURIComponent('いた2.mp3')),
+];
+painSounds.forEach(s => { s.preload = 'auto'; });
+function playPainSound() {
+  const s = painSounds[Math.floor(Math.random() * painSounds.length)];
+  s.currentTime = 0;
+  s.play().catch(() => {});
+}
+
+// ------- 火炎ブレスの効果音 -------
+const fireSound = new Audio('image/fire.mp3');
+fireSound.preload = 'auto';
+
+// ------- ボス登場の効果音 -------
+const bossAppearSound = new Audio('image/boss.mp3');
+bossAppearSound.preload = 'auto';
+function playBossAppearSound() {
+  bossAppearSound.currentTime = 0;
+  bossAppearSound.play().catch(() => {});
+}
+function playFireSound() {
+  fireSound.currentTime = 0;
+  fireSound.play().catch(() => {});
+}
+
+// ------- BGM：ステージ1〜3は通常BGM、ステージ4のみボスBGM -------
+// ブラウザはマウス/キーボード等の「本物のユーザー操作」がないと音声再生を許可しない。
+// コントローラーのボタン入力はこの「操作」として認められないため、
+// 本物の操作が一度あったかどうかをこのフラグで記録し、音まわりの初期化条件に使う
+let hasRealUserGesture = false;
+
+// file://（htmlをダブルクリックして直接開いた場合など）で読み込むと、
+// createMediaElementSource() 経由の出力がCORS制限で常に無音（ゼロ）になってしまう。
+// audio.paused は false のまま・再生位置も進むため一見「再生中」に見えるが実際は無音になり、
+// BGMだけ鳴らない（噛みつき等の効果音はこの経路を通らないので正常に鳴る）というバグの原因になる。
+// そのため file:// では音量ブースト用のAudioContext経由をそもそも使わず、
+// 通常の<audio>再生（volume=1.0）のみにフォールバックする
+const canUseAudioBoost = location.protocol !== 'file:';
+
+const bgmAudio = new Audio('image/bgm2.mp3');
+bgmAudio.loop = true;
+// HTMLの volume は最大1.0までしか上げられないため、そこからさらに音量を上げる分は
+// Web Audio API の GainNode で追加ブーストする（+10dBぶん）
+bgmAudio.volume = 1.0;
+let bgmAudioCtx = null;
+function ensureBgmBoost() {
+  // 重要：createMediaElementSource() を呼ぶと音声出力がAudioContext経由に恒久的に切り替わる。
+  // 本物のユーザー操作なしで作られたAudioContextはsuspendedのまま復帰できないことがあり、
+  // その場合「再生中なのに完全無音」になる。そのため本物の操作が来るまでブースト自体を作らない
+  // （ブーストなしでもvolume=1.0で普通に音は出る）
+  if (!bgmAudioCtx && hasRealUserGesture && canUseAudioBoost) {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      bgmAudioCtx = new AC();
+      const src = bgmAudioCtx.createMediaElementSource(bgmAudio);
+      const gainNode = bgmAudioCtx.createGain();
+      // 元の音量0.5を基準に+10dB（≒3.16倍）にしたい。volume を1.0（0.5からは既に+6dB分）まで
+      // 上げてあるので、GainNode ではその残り分だけを追加でブーストする
+      const targetLinearFromOriginal = Math.pow(10, 10 / 20);
+      gainNode.gain.value = (0.5 * targetLinearFromOriginal) / bgmAudio.volume;
+      src.connect(gainNode).connect(bgmAudioCtx.destination);
+    } catch (err) {
+      console.error('bgm boost setup failed:', err);
+    }
+  }
+  // ブラウザの自動再生ポリシーでコンテキストが一時停止されたままだと無音になるため、
+  // 生成済みでも毎回サスペンド状態を確認して再開を試みる
+  if (bgmAudioCtx && bgmAudioCtx.state === 'suspended') {
+    bgmAudioCtx.resume().catch(() => {});
+  }
+}
+const bossBgmAudio = new Audio('image/' + encodeURIComponent('boss bgm.mp3'));
+bossBgmAudio.loop = true;
+// HTMLの volume は最大1.0までしか上げられないため、そこからさらに音量を上げる分は
+// Web Audio API の GainNode で追加ブーストする（+10dBぶん）
+bossBgmAudio.volume = 1.0;
+let bossBgmAudioCtx = null;
+function ensureBossBgmBoost() {
+  // ensureBgmBoost と同じ理由で、本物のユーザー操作が来るまでブーストを作らない
+  if (!bossBgmAudioCtx && hasRealUserGesture && canUseAudioBoost) {
+    try {
+      const AC = window.AudioContext || window.webkitAudioContext;
+      bossBgmAudioCtx = new AC();
+      const src = bossBgmAudioCtx.createMediaElementSource(bossBgmAudio);
+      const gainNode = bossBgmAudioCtx.createGain();
+      // 元の音量0.5を基準に+10dB（≒3.16倍）にしたい。volume を1.0（0.5からは既に+6dB分）まで
+      // 上げてあるので、GainNode ではその残り分だけを追加でブーストする
+      const targetLinearFromOriginal = Math.pow(10, 10 / 20);
+      gainNode.gain.value = (0.5 * targetLinearFromOriginal) / bossBgmAudio.volume;
+      src.connect(gainNode).connect(bossBgmAudioCtx.destination);
+    } catch (err) {
+      console.error('boss bgm boost setup failed:', err);
+    }
+  }
+  // ブラウザの自動再生ポリシーでコンテキストが一時停止されたままだと無音になるため、
+  // 生成済みでも毎回サスペンド状態を確認して再開を試みる
+  if (bossBgmAudioCtx && bossBgmAudioCtx.state === 'suspended') {
+    bossBgmAudioCtx.resume().catch(() => {});
+  }
+}
+function updateBgmForStage() {
+  if (stage >= STAGE_MAX) {
+    if (!bgmAudio.paused) bgmAudio.pause();
+    ensureBossBgmBoost(); // 再生中でもAudioContextがサスペンドされていないか毎回確認する
+    if (bossBgmAudio.paused) bossBgmAudio.play().catch(() => {});
+  } else {
+    if (!bossBgmAudio.paused) bossBgmAudio.pause();
+    ensureBgmBoost(); // 再生中でもAudioContextがサスペンドされていないか毎回確認する
+    if (bgmAudio.paused) bgmAudio.play().catch(() => {});
+  }
+}
+
+// ------- キャラクター画像（頭部と胴体を分離した2枚） -------
+const headImg = new Image();
+const bodyImg = new Image();
+const fireModeHeadImg = new Image();
+const fireModeBodyImg = new Image();
+let headLoaded = false, bodyLoaded = false, fireModeHeadLoaded = false, fireModeBodyLoaded = false;
+headImg.onload = () => { headLoaded = true; };
+bodyImg.onload = () => { bodyLoaded = true; };
+fireModeHeadImg.onload = () => { fireModeHeadLoaded = true; };
+fireModeBodyImg.onload = () => { fireModeBodyLoaded = true; };
+headImg.src = 'image/flytrap_head.png';
+bodyImg.src = 'image/flytrap_body.png';
+fireModeHeadImg.src = 'image/' + encodeURIComponent('fire mode.png');
+fireModeBodyImg.src = 'image/body_fire.png';
+
+// 炎を吐ける状態(fireReady)になった瞬間から、実際にブレスしている間もずっと燃えて見えるようにする
+function isBurning() { return fireReady || fireShots.length > 0; }
+
+// 元画像の切り出し寸法（px）と、胴体側にあけた「頭部用の穴」の位置
+const HEAD_NATIVE = { w: 355, h: 295 };
+const BODY_NATIVE = { w: 690, h: 598 };
+const HOLE_NATIVE = { x: 182, y: 0, w: 355, h: 295 }; // 胴体画像内での穴の位置とサイズ
+
+// 表示スケール（低解像度キャンバス基準）
+const BS = 0.175;
+
+// ------- ハチ（敵）画像：本体と羽を別レイヤーで読み込み、羽だけ羽ばたかせる -------
+const waspBodyImg = new Image();
+const waspWingsImg = new Image();
+let waspBodyLoaded = false, waspWingsLoaded = false;
+waspBodyImg.onload = () => { waspBodyLoaded = true; };
+waspWingsImg.onload = () => { waspWingsLoaded = true; };
+waspBodyImg.src = 'image/wasp_body_web.png';
+waspWingsImg.src = 'image/wasp_wings_web.png';
+
+// 本体・羽は同じ元画像から近い基準点で切り出しているため、共通の原点を使って重ねられる
+const WASP_BODY_NATIVE = { w: 203, h: 197 };
+const WASP_WINGS_NATIVE = { w: 150, h: 100 };
+const WASP_WING_PIVOT = { x: 134, y: 92 }; // 羽レイヤー内の付け根（羽ばたきの回転軸）
+const WASP_BS = 0.19; // 表示スケール（一回り小さく調整）
+
+// ------- コウモリ（敵）画像 -------
+const batImg = new Image();
+let batLoaded = false;
+batImg.onload = () => { batLoaded = true; };
+batImg.src = 'image/bat_web.png';
+const BAT_NATIVE = { w: 180, h: 82 };
+const BAT_BS = 0.28; // 表示スケール
+
+// ------- 炎（火炎ブレス）画像 -------
+const fireImg = new Image();
+let fireLoaded = false;
+fireImg.onload = () => { fireLoaded = true; };
+fireImg.src = 'image/fire_web.png';
+const FIRE_NATIVE = { w: 220, h: 86 };
+const FIRE_BS = 0.6; // 表示スケール
+
+// ------- ボス（ステージ4専用）画像：本体と羽を別レイヤーで読み込み、羽だけ羽ばたかせる -------
+const bossBodyImg = new Image();
+const bossWingsImg = new Image();
+let bossBodyLoaded = false, bossWingsLoaded = false;
+bossBodyImg.onload = () => { bossBodyLoaded = true; };
+bossWingsImg.onload = () => { bossWingsLoaded = true; };
+bossBodyImg.src = 'image/boss_body_web.png';
+bossWingsImg.src = 'image/boss_wings_web.png';
+
+// 本体・羽は同じ元画像から近い基準点で切り出しているため、共通の原点を使って重ねられる
+const BOSS_BODY_NATIVE = { w: 331, h: 330 };
+const BOSS_WINGS_NATIVE = { w: 220, h: 131 };
+const BOSS_WING_PIVOT = { x: 203, y: 122 }; // 羽レイヤー内の付け根（羽ばたきの回転軸）
+const BOSS_BS = 0.27; // 表示スケール（従来のボス表示サイズに合わせる）
+
+// 胴体の設置位置（スタート地点。ここを基準に左右へゆっくりランダム移動する）
+const bodyAnchorX = 90;
+const bodyAnchorY = groundY - BODY_NATIVE.h * BS;
+let bodyDrawX = bodyAnchorX - (BODY_NATIVE.w * BS) / 2;
+let bodyDrawY = bodyAnchorY;
+
+// 胴体の「穴」＝首の付け根の位置（ワールド座標。胴体の移動に追従して毎フレーム更新する）
+const neckBase = {
+  x: bodyDrawX + (HOLE_NATIVE.x + HOLE_NATIVE.w / 2) * BS,
+  y: bodyDrawY + (HOLE_NATIVE.y + HOLE_NATIVE.h) * BS,
+};
+
+// ------- キャラクターのゆっくりした左右移動（移動2秒→静止3秒を繰り返す） -------
+const CHAR_MOVE_RANGE = 50;    // スタート地点から離れる最大距離(px、低解像度座標)
+const CHAR_MOVE_MS = 2000;     // 移動にかける時間
+const CHAR_IDLE_MS = 3000;     // 静止している時間
+let charMoveState = 'idle';
+let charMoveStateT = performance.now();
+let charOffsetX = 0;           // 現在のスタート地点からのズレ
+let charMoveStartOffset = 0;
+let charMoveTargetOffset = 0;
+let charBobY = 0;               // 移動中だけ足がちょこちょこ動く小刻みな上下バウンス
+
+function updateCharacterMovement(t) {
+  const elapsed = t - charMoveStateT;
+  if (charMoveState === 'idle') {
+    charBobY = 0;
+    if (elapsed > CHAR_IDLE_MS) {
+      charMoveState = 'moving';
+      charMoveStateT = t;
+      charMoveStartOffset = charOffsetX;
+      charMoveTargetOffset = (Math.random() * 2 - 1) * CHAR_MOVE_RANGE;
+    }
+  } else {
+    const p = clampNum(elapsed / CHAR_MOVE_MS, 0, 1);
+    const eased = p * p * (3 - 2 * p); // 滑らかに動き出して滑らかに止まる
+    charOffsetX = charMoveStartOffset + (charMoveTargetOffset - charMoveStartOffset) * eased;
+    // 足がちょこちょこ動く様子を、小刻みな上下バウンスで表現する
+    charBobY = Math.abs(Math.sin(t / 80)) * 2.2;
+    if (elapsed > CHAR_MOVE_MS) {
+      charMoveState = 'idle';
+      charMoveStateT = t;
+      charOffsetX = charMoveTargetOffset;
+      charBobY = 0;
+    }
+  }
+  bodyDrawX = bodyAnchorX - (BODY_NATIVE.w * BS) / 2 + charOffsetX;
+  bodyDrawY = bodyAnchorY - charBobY;
+  neckBase.x = bodyDrawX + (HOLE_NATIVE.x + HOLE_NATIVE.w / 2) * BS;
+  neckBase.y = bodyDrawY + (HOLE_NATIVE.y + HOLE_NATIVE.h) * BS;
+}
+
+const NECK_REST = 6;    // 通常時の首の長さ
+const NECK_MAX = 108;   // 伸ばせる最大の長さ
+const NECK_LUNGE = 26;  // 噛みつき時に追加で伸びる長さ
+
+// ------- マウス追従 -------
+let mouseHi = { x: (neckBase.x + 40) * SCALE, y: (neckBase.y - 60) * SCALE };
+canvas.addEventListener('mousemove', e => {
+  const rect = canvas.getBoundingClientRect();
+  mouseHi.x = (e.clientX - rect.left) * (W / rect.width);
+  mouseHi.y = (e.clientY - rect.top) * (H / rect.height);
+});
+
+// ------- ゲームパッド（PS5等）対応：左スティックで狙いを操作、×ボタンで噛みつき、○ボタンで炎を吐く -------
+let gamepadIndex = null;
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('gamepadconnected', e => { gamepadIndex = e.gamepad.index; });
+  window.addEventListener('gamepaddisconnected', e => { if (gamepadIndex === e.gamepad.index) gamepadIndex = null; });
+}
+let prevGamepadBite = false;
+let prevGamepadFireBtn = false;
+let prevGamepadAnyButton = false;
+let gamepadError = null; // 直近のゲームパッド関連エラー（画面のデバッグ表示に使う）
+let smoothStick = { x: 0, y: 0 }; // スティック入力をゆっくり追従させるための平滑化バッファ
+function pollGamepad() {
+  // ゲームパッドまわりで何が起きても描画ループ自体は絶対に止めない
+  try {
+    if (typeof navigator === 'undefined' || !navigator.getGamepads) {
+      gamepadError = 'Gamepad API非対応';
+      return;
+    }
+    const gamepads = navigator.getGamepads ? navigator.getGamepads() : [];
+    if (gamepadIndex === null) {
+      // 'gamepadconnected' イベントは、ページ読み込み前から接続済みの場合など
+      // 発火しないことがあるため、毎フレームここでも接続済みのゲームパッドを拾えるようにする
+      for (let i = 0; i < gamepads.length; i++) {
+        if (gamepads[i]) { gamepadIndex = i; break; }
+      }
+      if (gamepadIndex === null) return;
+    }
+    const gp = gamepads && gamepads[gamepadIndex];
+    if (!gp) { gamepadIndex = null; return; }
+
+    const axes = gp.axes || [];
+    const stickX = axes[0] || 0, stickY = axes[1] || 0;
+    const deadzone = 0.15;
+    const mag = Math.hypot(stickX, stickY);
+    if (Number.isFinite(mag) && mag > deadzone) {
+      // スティックの生値ではなく、ゆっくり追従する平滑化した値を使うことで動きを穏やかにする
+      smoothStick.x += (stickX - smoothStick.x) * 0.02;
+      smoothStick.y += (stickY - smoothStick.y) * 0.02;
+      const smoothMag = Math.hypot(smoothStick.x, smoothStick.y) || 0.0001;
+      const nx = smoothStick.x / smoothMag, ny = smoothStick.y / smoothMag;
+      const reachPx = Math.min(smoothMag, 1) * NECK_MAX * 1.3; // 最大リーチまで出しやすいよう少し余裕を持たせる
+      mouseHi.x = (neckBase.x + nx * reachPx) * SCALE;
+      mouseHi.y = (neckBase.y + ny * reachPx) * SCALE;
+    }
+    // スティックがニュートラル(deadzone以下)のときは何もしない＝直前の位置のまま静止する
+    // （デフォルト位置へ戻したりはしない）
+
+    const buttons = gp.buttons || [];
+    const bitePressed = !!(buttons[0] && buttons[0].pressed); // ×(クロス)ボタン＝噛みつく
+    const firePressed = !!(buttons[1] && buttons[1].pressed); // ○(サークル)ボタン＝炎を吐く
+
+    // どれかのボタンが新しく押された瞬間を検知し、'start'状態ならゲームを開始、
+    // プレイ中ならAudioContextの再開を毎回試みる（コントローラーのみの操作にも対応）
+    const anyButtonPressed = buttons.some(b => b && b.pressed);
+    if (anyButtonPressed && !prevGamepadAnyButton) {
+      if (gameState === 'start') startGame();
+      else updateBgmForStage();
+    }
+    prevGamepadAnyButton = anyButtonPressed;
+
+    if (bitePressed && !prevGamepadBite) triggerBiteButton();
+    if (firePressed && !prevGamepadFireBtn) triggerFireButton();
+    prevGamepadBite = bitePressed;
+    prevGamepadFireBtn = firePressed;
+    gamepadError = null; // ここまで来られたら正常
+  } catch (err) {
+    // iframe内でgamepad権限がブロックされている場合などはここに来る。原因を画面に出せるよう記録する
+    gamepadError = (err && err.message) ? String(err.message).slice(0, 60) : String(err);
+    console.error('gamepad polling error:', err);
+  }
+}
+
+let biteT = 0;
+
+// 首の先端（頭部の付け根）の現在位置。イージングで滑らかに追従させる
+let headAttach = { x: neckBase.x, y: neckBase.y - NECK_REST };
+
+function clampNum(v, lo, hi) { return Math.max(lo, Math.min(hi, v)); }
+
+// ------- ゲーム状態 -------
+let score = 0;
+let stage = 1;
+const STAGE_MAX = 3; // 最終ステージ。ここでボスが出現し、倒すとゲームクリア
+let stageProgress = 0;
+let stageGoal = 8;
+// 'start'（開始待ち。クリック/キー入力でBGMをブラウザに許可させてから始める） | 'play' | 'gameover' | 'cleared'
+let gameState = 'start';
+let toast = null;
+let hitFlash = 0;
+
+let power = 0;
+const POWER_MAX = 4; // ハエを4回食べると火炎ブレスが発射可能になる
+let orbCharge = false; // ファイアボールを取って得た発射権。ハエのメーター(power)とは別にカウントする
+let fireReady = false; // 準備完了になると true。次のクリックで火炎ブレスを発射する
+
+// 火炎ブレス関連
+let fireShots = [];              // 現在発動中の炎（複数方向ぶん）
+let fireBatchCounter = 0;        // 発射1回ごとに増える識別子（ボスの多重ヒット防止に使う）
+const FIRE_SPREAD = 0.4;         // 3方向の開き角（ラジアン）
+const FIRE_RANGE = 420;          // 炎の届く距離（画面右端まで届くように）
+const FIRE_DURATION = 700;       // 炎の当たり判定が有効な時間(ms)。前より伸びるスピードを遅くした
+const FIRE_HIT_R = 16;           // 炎の太さ（当たり判定半径）
+const FIRE_BONUS = 80;           // 炎で敵を倒したときのボーナス得点
+
+// 火炎ブレスが使えるようになるアイテム（赤い●）。約4秒に1回出現する
+let orbSpawnTimer = 3000 + Math.random() * 1000;
+
+// ボス（ステージ4から登場。画面右側で上下運動のみ、炎を3発当てると倒せる）
+let boss = null;
+const BOSS_MAX_HP = 5;
+const BOSS_BONUS = 500;
+
+// 体力ゲージ（時間経過で少しずつ減り、敵と接触すると大きく減る。0になるとゲームオーバー）
+let stamina = 100;
+const STAMINA_MAX = 100;
+const STAMINA_DRAIN_MS = 40000; // 満タンから0になるまでの時間（時間経過分のみ。減るスピードを半分に）
+const DAMAGE_STAMINA_RATIO = 1 / 3; // 敵と接触した際に減るゲージの割合
+let staminaHitT = -Infinity; // 直近でダメージを受けた時刻（ゲージの震え演出に使う）
+let lastFrameT = null;
+
+function showToast(text, frames) {
+  toast = { text, timer: frames };
+}
+
+// ダメージ共通処理：体力ゲージを1/3減らし、ゲージの震え演出＋画面赤フラッシュ＋ダメージ音を鳴らす
+// （火炎ブレスの準備状態はここではリセットしない。ダメージを受けても発射権はキープされる）
+function takeDamage() {
+  stamina -= STAMINA_MAX * DAMAGE_STAMINA_RATIO;
+  staminaHitT = performance.now();
+  hitFlash = 1;
+  playPainSound();
+  if (stamina <= 0) {
+    stamina = 0;
+    gameState = 'gameover';
+  }
+}
+
+// ------- 虫（低解像度座標。neckBase を基準に届く範囲へ配置） -------
+// 食べられる（edible）か、避けるべき（!edible）かをタイプごとに定義
+// flying: true の虫は画面右から左へ流れる。ground: true の虫は地面に静止する
+// hazard: true は触れるだけでダメージ＆炎で撃破できる「敵」。fireOrb はどちらでもない特殊アイテム
+const KIND_INFO = {
+  fly:     { edible: true,  points: 10, flying: true,  ground: false },
+  bee:     { edible: false, flying: true,  ground: false, hazard: true },
+  spider:  { edible: false, flying: false, ground: true,  hazard: true },
+  bat:     { edible: false, flying: true,  ground: false, hazard: true },
+  fireOrb: { edible: false, flying: true,  ground: false, hazard: false },
+};
+
+// ハエ・ハチ・アイテムは画面右から左へ流れてくる。速度帯を分けてそれぞれに個性を持たせる
+const SPEED_PROFILES = {
+  fly: [
+    { min: 30, max: 50 },   // のんびり系
+    { min: 65, max: 95 },   // ふつう
+    { min: 120, max: 165 }, // すばしっこい系
+  ],
+  bee: [
+    { min: 55, max: 80 },   // のんびり
+    { min: 90, max: 125 },  // ふつう
+    { min: 140, max: 180 }, // はやい
+    { min: 190, max: 235 }, // 超速
+  ],
+  bat: [
+    { min: 65, max: 100 },
+  ],
+  fireOrb: [
+    { min: 190, max: 235 }, // 一番速いハチと同程度
+  ],
+};
+
+// ハチはステージが上がるほど速いタイプが出やすくなる（重み付き抽選）。ハエは常に均等抽選
+function pickSpeedProfile(type) {
+  const profiles = SPEED_PROFILES[type];
+  if (type !== 'bee') return profiles[Math.floor(Math.random() * profiles.length)];
+  const n = profiles.length;
+  const stageFactor = Math.min(stage - 1, 12);
+  const weights = profiles.map((_, i) => 1 + stageFactor * 0.5 * (i / (n - 1)));
+  const total = weights.reduce((a, b) => a + b, 0);
+  let r = Math.random() * total;
+  for (let i = 0; i < n; i++) { r -= weights[i]; if (r <= 0) return profiles[i]; }
+  return profiles[n - 1];
+}
+
+// 単純な一様乱数だと同時に出ている数が少ないときに偶然同じ帯に固まって見えることがあるため、
+// 画面を縦にいくつかのレーンへ分け、シャッフルした順で使い切ってから次の周をシャッフルする方式で
+// 「上下にまんべんなく出現する」ことを保証する
+const SPAWN_LANES = 6;
+let spawnLaneQueue = [];
+function nextSpawnBaseY() {
+  if (spawnLaneQueue.length === 0) {
+    spawnLaneQueue = Array.from({ length: SPAWN_LANES }, (_, i) => i);
+    for (let i = spawnLaneQueue.length - 1; i > 0; i--) {
+      const j = Math.floor(Math.random() * (i + 1));
+      [spawnLaneQueue[i], spawnLaneQueue[j]] = [spawnLaneQueue[j], spawnLaneQueue[i]];
+    }
+  }
+  const lane = spawnLaneQueue.pop();
+  const top = 14, bottom = groundY - 16;
+  const laneH = (bottom - top) / SPAWN_LANES;
+  return top + laneH * lane + Math.random() * laneH;
+}
+
+function resetFlyingInsect(o, t, type) {
+  const profile = pickSpeedProfile(type);
+  o.spawnT = t;
+  o.startX = IW + 20 + Math.random() * 60;
+  o.baseY = nextSpawnBaseY(); // 画面下のほうまで満遍なく出現させ、下側が安全地帯にならないようにする
+  o.speedPxPerSec = profile.min + Math.random() * (profile.max - profile.min);
+  o.phase = Math.random() * 10;
+  if (type === 'bat') o.movePattern = Math.floor(Math.random() * 3); // 動きのパターンを3種からランダムに
+  if (type === 'bee') {
+    // ハチは2種類：まっすぐ飛ぶタイプと、斜めに（上下にゆるく流れながら）飛ぶタイプ
+    o.movePattern = Math.random() < 0.5 ? 0 : 1;
+    o.diagSlope = (Math.random() < 0.5 ? -1 : 1) * (18 + Math.random() * 14); // px/秒。斜め飛行タイプの傾き
+  }
+}
+function makeFlyingInsect(type) {
+  const o = { type, alive: true };
+  resetFlyingInsect(o, performance.now(), type);
+  return o;
+}
+function makeFly() { return makeFlyingInsect('fly'); }
+function makeBee() { return makeFlyingInsect('bee'); }
+function makeBat() { return makeFlyingInsect('bat'); }
+function makeFireOrb() { return makeFlyingInsect('fireOrb'); }
+
+// ボス登場演出：出現の瞬間から2秒間は画面外から飛んでくる専用アニメーションを再生する
+const BOSS_INTRO_MS = 2000;
+const BOSS_INTRO_START_X = IW + 90; // 画面外（右）からスタート
+
+function makeBoss() {
+  const now = performance.now();
+  return {
+    hp: BOSS_MAX_HP, x: IW - 55, baseY: IH * 0.42, phase: Math.random() * 10, lastHitBatch: -1,
+    // 突進タイマーは登場演出が終わってからカウントを始める
+    dashState: 'idle', dashStateT: now + BOSS_INTRO_MS, shakeT: -Infinity,
+    dashFromX: 0, dashFromY: 0, dashTargetX: 0, dashTargetY: 0,
+    lastContactHitT: -Infinity,
+    introStartT: now, introUntil: now + BOSS_INTRO_MS,
+  };
+}
+
+// ボスの突進：4秒に1回、少し後ろに下がってから(windup)プレイヤーめがけて突進(dash)し、元の位置へ戻る(return)
+const BOSS_DASH_INTERVAL = 4000;
+const BOSS_WINDUP_MS = 400;
+const BOSS_DASH_MS = 480;  // 突進の移動時間（長いほどゆっくり動く）
+const BOSS_RETURN_MS = 500;
+const BOSS_WINDUP_OFFSET = 18;  // 下がる距離
+const BOSS_FIRE_HIT_R = 40;     // 炎がボスに当たったと判定する半径
+const BOSS_CONTACT_R = 34;      // 突進がプレイヤーに当たったと判定する半径
+const BOSS_CONTACT_COOLDOWN = 1200; // 突進の接触ダメージの連続ヒット防止(ms)
+
+function bossRestPos(t) {
+  return { x: boss.x, y: boss.baseY + Math.sin(t / 500 + boss.phase) * 45 };
+}
+
+function updateBossDash(t) {
+  if (!boss) return;
+  const elapsed = t - boss.dashStateT;
+  if (boss.dashState === 'idle') {
+    if (elapsed > BOSS_DASH_INTERVAL) { boss.dashState = 'windup'; boss.dashStateT = t; }
+  } else if (boss.dashState === 'windup') {
+    if (elapsed > BOSS_WINDUP_MS) {
+      // 突進が始まる瞬間のプレイヤー位置を狙う
+      const rest = bossRestPos(t);
+      boss.dashFromX = rest.x + BOSS_WINDUP_OFFSET;
+      boss.dashFromY = rest.y;
+      const hc = headCenter();
+      boss.dashTargetX = hc.x;
+      boss.dashTargetY = hc.y;
+      boss.dashState = 'dash'; boss.dashStateT = t;
+      playBossAppearSound(); // 急突進の瞬間にも登場時と同じ効果音を鳴らす
+    }
+  } else if (boss.dashState === 'dash') {
+    if (elapsed > BOSS_DASH_MS) { boss.dashState = 'return'; boss.dashStateT = t; }
+  } else if (boss.dashState === 'return') {
+    if (elapsed > BOSS_RETURN_MS) { boss.dashState = 'idle'; boss.dashStateT = t; }
+  }
+}
+
+// 突進中にボスとプレイヤーの頭が近づいたらダメージ（連続ヒットはクールダウンで防止）
+function checkBossContact(t) {
+  if (!boss) return;
+  const bp = bossPos(t);
+  const hc = headCenter();
+  const dist = Math.hypot(bp.x - hc.x, bp.y - hc.y);
+  if (dist < BOSS_CONTACT_R && t - boss.lastContactHitT > BOSS_CONTACT_COOLDOWN) {
+    boss.lastContactHitT = t;
+    takeDamage();
+  }
+}
+
+function bossPos(t) {
+  if (!boss) return { x: 0, y: 0 };
+  if (t < boss.introUntil) {
+    // 登場演出：画面外からゆっくり減速しながら定位置まで飛んでくる
+    const p = clampNum((t - boss.introStartT) / (boss.introUntil - boss.introStartT), 0, 1);
+    const eased = 1 - Math.pow(1 - p, 3);
+    return {
+      x: BOSS_INTRO_START_X + (boss.x - BOSS_INTRO_START_X) * eased,
+      y: boss.baseY + Math.sin(t / 500 + boss.phase) * 45,
+    };
+  }
+  const rest = bossRestPos(t);
+  if (boss.dashState === 'windup') {
+    const p = clampNum((t - boss.dashStateT) / BOSS_WINDUP_MS, 0, 1);
+    return { x: rest.x + BOSS_WINDUP_OFFSET * p, y: rest.y };
+  }
+  if (boss.dashState === 'dash') {
+    const p = clampNum((t - boss.dashStateT) / BOSS_DASH_MS, 0, 1);
+    return {
+      x: boss.dashFromX + (boss.dashTargetX - boss.dashFromX) * p,
+      y: boss.dashFromY + (boss.dashTargetY - boss.dashFromY) * p,
+    };
+  }
+  if (boss.dashState === 'return') {
+    const p = clampNum((t - boss.dashStateT) / BOSS_RETURN_MS, 0, 1);
+    return {
+      x: boss.dashTargetX + (rest.x - boss.dashTargetX) * p,
+      y: boss.dashTargetY + (rest.y - boss.dashTargetY) * p,
+    };
+  }
+  return rest; // idle
+}
+
+function spawnGroundX() {
+  return neckBase.x + (Math.random() * 2 - 1) * 100;
+}
+function spawnPosFor(type) {
+  return { x: spawnGroundX(), y: groundY - 3 };
+}
+function makeInsect(type) {
+  if (KIND_INFO[type].flying) return makeFlyingInsect(type);
+  const p = spawnPosFor(type);
+  return { type, baseX: p.x, baseY: p.y, phase: Math.random() * 10, alive: true };
+}
+
+// 敵の出現数は難しくなりすぎないよう、以前の想定数のおよそ8割に調整
+const DIFF_SCALE = 0.8;
+
+// ハエはボス戦になったら少し数を増やす（他の面は従来通り3匹のまま）
+const FLY_MAX = 8;
+function syncFlyCount() {
+  const raw = stage >= STAGE_MAX ? FLY_MAX : 3;
+  const target = Math.max(1, Math.round(raw * DIFF_SCALE));
+  let current = insects.filter(o => o.type === 'fly').length;
+  while (current < target) { insects.push(makeFly()); current++; }
+}
+
+const BEE_MAX = 8;
+function syncBeeCount() {
+  // 最終ステージ(3)は、以前ステージ4で使っていた数(raw=5)をベースに、敵の数をさらに4/5に減らす
+  const raw = stage >= STAGE_MAX ? 5 * 0.8 : Math.min(2 + (stage - 1), BEE_MAX);
+  const target = Math.max(1, Math.round(raw * DIFF_SCALE));
+  let current = insects.filter(o => o.type === 'bee').length;
+  while (current < target) { insects.push(makeBee()); current++; }
+}
+
+// コウモリはステージ2から少しずつ出現し、ステージ4で大量に出てくる
+const BAT_MAX = 6;
+function syncBatCount() {
+  // 最終ステージ(3)は、以前ステージ4で使っていた数(raw=BAT_MAX)をベースに、敵の数をさらに4/5に減らす
+  const raw = stage < 2 ? 0 : stage >= STAGE_MAX ? BAT_MAX * 0.8 : 2;
+  const target = Math.round(raw * DIFF_SCALE);
+  let current = insects.filter(o => o.type === 'bat').length;
+  while (current < target) { insects.push(makeBat()); current++; }
+}
+
+let insects = [
+  makeFly(), makeFly(), makeFly(),
+  makeBee(), makeBee(),
+  makeInsect('spider'),
+];
+
+// 見た目の位置（飛ぶ虫は右→左へ移動、地上の虫は静止）
+function insectPos(o, t) {
+  if (o.stunned) {
+    // 炎に当たってしびれ、小刻みに震えながら画面下へ落ちていく
+    const dt = (t - o.stunT) / 1000;
+    const jitter = Math.sin(t / 30) * 6 + Math.sin(t / 17 + 1) * 3;
+    return { x: o.stunX + jitter, y: o.stunY + dt * dt * 260 };
+  }
+  if (KIND_INFO[o.type].flying) {
+    const dt = (t - o.spawnT) / 1000;
+    const x = o.startX - o.speedPxPerSec * dt;
+
+    if (o.type === 'bat') {
+      let y;
+      if (o.movePattern === 0) {
+        // 基本パターン：大きくゆったり上下に波打つ
+        y = o.baseY + Math.sin(t / 260 + o.phase) * 28;
+      } else if (o.movePattern === 1) {
+        // ジグザグパターン：2つの波を合成して不規則に揺れる
+        y = o.baseY + Math.sin(t / 150 + o.phase) * 16 + Math.sin(t / 370 + o.phase * 1.7) * 14;
+      } else {
+        // 急降下パターン：ゆっくり大きくダイブするように上下する
+        y = o.baseY + Math.sin(t / 500 + o.phase) * 42;
+      }
+      return { x, y };
+    }
+
+    if (o.type === 'bee' && o.movePattern === 1) {
+      // 斜め飛行タイプ：まっすぐ左に飛ぶのではなく、ゆるく上下に流れながら進む
+      const bob = 6;
+      const y = clampNum(o.baseY + o.diagSlope * dt + Math.sin(t / 300 + o.phase) * bob, 10, groundY - 10);
+      return { x, y };
+    }
+
+    // コウモリ以外（ハチ・ハエ）は軽い上下の揺れのみ
+    const bob = o.type === 'bee' ? 6 : 8;
+    const bobFreq = o.type === 'bee' ? 300 : 400;
+    return { x, y: o.baseY + Math.sin(t / bobFreq + o.phase) * bob };
+  }
+  return { x: o.baseX, y: o.baseY };
+}
+
+function scheduleRespawn(obj, delayMs) {
+  setTimeout(() => {
+    if (gameState === 'gameover') return;
+    if (KIND_INFO[obj.type].flying) {
+      resetFlyingInsect(obj, performance.now(), obj.type);
+    } else {
+      const p = spawnPosFor(obj.type);
+      obj.baseX = p.x; obj.baseY = p.y;
+      obj.phase = Math.random() * 10;
+    }
+    obj.alive = true;
+  }, delayMs);
+}
+
+function eatInsect(obj) {
+  obj.alive = false;
+
+  // 火炎ブレスのアイテム：かじると即座に発射準備が完了する（一過性のため再出現はしない）
+  // ハエを食べて溜めるメーター(power)とは別にカウントし、meterの進捗を消さないようにする
+  if (obj.type === 'fireOrb') {
+    orbCharge = true;
+    fireReady = true;
+    stamina = Math.min(STAMINA_MAX, stamina + STAMINA_MAX * 0.2); // ハエと同じく体力も2割回復する（stageProgressには加算しない）
+    showToast('🔥 火炎ゲット！', 50);
+    return;
+  }
+
+  const info = KIND_INFO[obj.type];
+  if (!info.edible) {
+    takeDamage();
+    scheduleRespawn(obj, 1800);
+    return;
+  }
+  score += info.points;
+  stageProgress += 1;
+  if (obj.type === 'fly') {
+    stamina = Math.min(STAMINA_MAX, stamina + STAMINA_MAX * 0.2); // ハエを食べると体力2割回復
+    power = Math.min(POWER_MAX, power + 1);
+    if (power >= POWER_MAX && !fireReady) fireReady = true;
+  }
+  if (stageProgress >= stageGoal) {
+    stageProgress = 0;
+    if (stage >= STAGE_MAX) {
+      // 最終ステージの食事目標を満たしてもゲームクリアにはしない（クリアはボス撃破のみ）
+    } else {
+      stage += 1;
+      stageGoal = 8; // 次のステージまでの必要数は全ステージ共通で8に統一
+      syncFlyCount();
+      syncBeeCount();
+      syncBatCount();
+      const bossJustSpawned = stage === STAGE_MAX && !boss;
+      if (bossJustSpawned) { boss = makeBoss(); playBossAppearSound(); }
+      updateBgmForStage();
+      const edibleCount = insects.filter(o => KIND_INFO[o.type].edible).length;
+      if (edibleCount < 8 && stage % 2 === 0) insects.push(makeFly());
+      if (bossJustSpawned) {
+        // 登場演出の間、既存の敵やアイテムは非表示のまま裏で移動し続けてしまうと
+        // 演出明けに画面の中途半端な位置へ突然現れて見えてしまう。
+        // 演出終了と同時に画面右から改めて出現し直すよう、飛行系オブジェクトの開始時刻を演出終了時刻に揃える
+        for (const o of insects) {
+          if (KIND_INFO[o.type].flying) resetFlyingInsect(o, boss.introUntil, o.type);
+        }
+      }
+      showToast(bossJustSpawned ? '⚠ ボス出現！！' : `ステージ ${stage}`, bossJustSpawned ? 130 : 90);
+    }
+  }
+  scheduleRespawn(obj, 1200 + Math.random() * 800);
+}
+
+// 頭（口）全体を判定範囲にする。首の付け根→頭の向きから頭の中心をおおまかに求める
+const HEAD_HIT_R = Math.max(HEAD_NATIVE.w, HEAD_NATIVE.h) * BS * 0.5;
+function headCenter() {
+  const hdx = headAttach.x - neckBase.x, hdy = headAttach.y - neckBase.y;
+  const hDist = Math.hypot(hdx, hdy) || 1;
+  const headHalfLen = (HEAD_NATIVE.h * BS) / 2;
+  return { x: headAttach.x + (hdx / hDist) * headHalfLen, y: headAttach.y + (hdy / hDist) * headHalfLen };
+}
+
+// クリックで狙って噛みつく（判定範囲内で一番近い虫を1匹食べる）
+function tryBite() {
+  const hc = headCenter();
+  const t = performance.now();
+
+  let best = null, bestDist = Infinity;
+  for (const o of insects) {
+    if (!o.alive || o.stunned) continue; // 炎で倒した敵（しびれ中）は対象外
+    // ハチ・コウモリ・クモなどのハザードは「触れるとダメージ」の対象であり噛みつく対象ではない。
+    // ここで除外しないと、ファイアボールやハエを狙ったつもりでもたまたま近くにいたハザードを
+    // 誤って噛んでしまい、敵に当たった自覚がないままダメージを受けるという不具合になる
+    if (KIND_INFO[o.type].hazard) continue;
+    const p = insectPos(o, t);
+    const d = Math.hypot(p.x - hc.x, p.y - hc.y);
+    if (d < HEAD_HIT_R && d < bestDist) { best = o; bestDist = d; }
+  }
+  if (best) eatInsect(best);
+}
+
+// 飛行する危険な虫（ハチ・コウモリ）はクリックしなくても頭に触れただけでダメージ
+// （炎で倒してしびれ落下中の敵には触れてもダメージなし）
+function checkFlyingHazardContact(t) {
+  const hc = headCenter();
+  for (const o of insects) {
+    if (!o.alive || o.stunned || !KIND_INFO[o.type].flying || !KIND_INFO[o.type].hazard) continue;
+    const p = insectPos(o, t);
+    if (Math.hypot(p.x - hc.x, p.y - hc.y) < HEAD_HIT_R) eatInsect(o);
+  }
+}
+
+// 敵を炎でしびれさせて画面下に落とす（撃破演出＋高得点）
+function stunInsect(o, t) {
+  const p = insectPos(o, t);
+  o.stunned = true;
+  o.stunT = t;
+  o.stunX = p.x;
+  o.stunY = p.y;
+  score += FIRE_BONUS;
+  showToast(`🔥 +${FIRE_BONUS}！`, 50);
+}
+
+// 頭部の描画と同じ計算で「口が向いている角度」を求める（首のカーブ分の補正込み）
+function headFacingAngle() {
+  const nx = headAttach.x - neckBase.x, ny = headAttach.y - neckBase.y;
+  const ctrlX = neckBase.x + nx * 0.5 - ny * 0.15;
+  const ctrlY = neckBase.y + ny * 0.5 + nx * 0.15;
+  const baseAngle = Math.atan2(headAttach.y - ctrlY, headAttach.x - ctrlX);
+  // 口の実際の向きに合わせて、首の角度から時計回りに90度回転させる
+  return baseAngle + Math.PI / 2;
+}
+
+// 口の向きから3方向（正面・左右）に炎を発射する。発射点は頭の付け根ではなく
+// 頭の中心（＝口があるあたり）にすることで、頭の上からではなく口から出ているように見せる
+function breathFire() {
+  const baseAngle = headFacingAngle();
+  const nowT = performance.now();
+  const origin = headCenter();
+  const batchId = ++fireBatchCounter;
+  fireShots = [-FIRE_SPREAD, 0, FIRE_SPREAD].map(off => ({
+    angle: baseAngle + off, ox: origin.x, oy: origin.y, startT: nowT, batchId,
+  }));
+  playFireSound();
+}
+
+// 炎(1方向ぶん)が座標pに当たっているか判定する
+// 炎がその瞬間に届いている距離（見た目のアニメーションと当たり判定を一致させる）
+function fireShotReach(f, t) {
+  const life = clampNum((t - f.startT) / FIRE_DURATION, 0, 1);
+  return FIRE_RANGE * Math.min(1, life * 1.15);
+}
+
+// 発射点から先端(reach)までの線分に対する実際の距離で判定する。
+// 単純な「角度差×距離」の近似だと発射点のすぐ近くはどの方向でも必ず判定内に入ってしまうため
+// （＝キャラクターのすぐ左側にいる敵が、狙っていなくても落ちてしまう不具合の原因だった）、
+// 線分上の最近接点との本当のユークリッド距離で当たり判定を取る
+function fireHits(f, p, radius, maxDist) {
+  const r = radius || FIRE_HIT_R;
+  const limit = maxDist != null ? maxDist : FIRE_RANGE;
+  const dirX = Math.cos(f.angle), dirY = Math.sin(f.angle);
+  const px = p.x - f.ox, py = p.y - f.oy;
+  const proj = px * dirX + py * dirY; // 炎の進行方向への射影（発射点からの符号付き距離）
+  if (proj < 0) return false; // 発射点より後ろ（逆方向）は対象外
+  const clamped = Math.min(proj, limit);
+  const closestX = f.ox + dirX * clamped, closestY = f.oy + dirY * clamped;
+  const dist = Math.hypot(p.x - closestX, p.y - closestY);
+  return dist < r;
+}
+
+// 発動中の炎に敵が触れていないか毎フレーム判定する（炎は貫通するので複数の敵に当たり続ける）
+function updateFire(t) {
+  fireShots = fireShots.filter(f => t - f.startT < FIRE_DURATION);
+  if (!fireShots.length) return;
+
+  for (const o of insects) {
+    if (!o.alive || o.stunned || !KIND_INFO[o.type].hazard) continue;
+    const p = insectPos(o, t);
+    for (const f of fireShots) {
+      if (fireHits(f, p, undefined, fireShotReach(f, t))) { stunInsect(o, t); break; }
+    }
+  }
+
+  if (boss) {
+    const bp = bossPos(t);
+    for (const f of fireShots) {
+      if (f.batchId === boss.lastHitBatch) continue; // 同じ1回のブレスでは1回しかヒットしない
+      if (fireHits(f, bp, BOSS_FIRE_HIT_R, fireShotReach(f, t))) {
+        boss.hp -= 1;
+        boss.lastHitBatch = f.batchId;
+        boss.shakeT = t; // ここから少しの間ビリビリと震える
+        if (boss.hp <= 0) {
+          score += BOSS_BONUS;
+          showToast(`🔥 ボス撃破！ +${BOSS_BONUS}`, 90);
+          boss = null;
+          gameState = 'cleared'; // ゲームクリアはボスを倒したときのみ
+        } else {
+          showToast(`ボスに命中！ 残り${boss.hp}`, 50);
+        }
+        break;
+      }
+    }
+  }
+}
+
+function resetGame() {
+  score = 0; stage = 1; stageProgress = 0; stageGoal = 8;
+  power = 0; orbCharge = false; fireReady = false; fireShots = []; stamina = STAMINA_MAX; staminaHitT = -Infinity;
+  boss = null; orbSpawnTimer = 3000 + Math.random() * 1000;
+  charMoveState = 'idle'; charMoveStateT = performance.now(); charOffsetX = 0; charBobY = 0;
+  updateBgmForStage();
+  insects = [
+    makeFly(), makeFly(), makeFly(),
+    makeBee(), makeBee(),
+    makeInsect('spider'),
+  ];
+  gameState = 'play';
+}
+
+// 噛みつき動作そのもの（音＋範囲内の虫を1匹食べる）
+function doBite() {
+  biteT = 1;
+  playBiteSound();
+  tryBite();
+}
+
+// 火炎ブレスそのもの（準備ができていないときは何もしない）
+function doFire() {
+  if (!fireReady) return false;
+  biteT = 1;
+  breathFire();
+  // ファイアボール由来の発射権とハエのメーターは別カウントなので、
+  // 実際に発射に使った側だけを消費する（メーターの進捗を無関係に消さない）
+  if (orbCharge) {
+    orbCharge = false;
+  } else {
+    power = 0;
+  }
+  fireReady = power >= POWER_MAX || orbCharge;
+  return true;
+}
+
+// ブラウザの自動再生ポリシー対策：ページ側で検知できる「本物のユーザー操作」
+// （クリック／キー入力）が一度も無いと、BGMの再生が許可されないブラウザがある。
+// そのため開始直後は 'start' 状態にしておき、最初の操作でBGMを鳴らしてからプレイを始める
+let gameStartedAtT = -Infinity;
+function startGame() {
+  if (gameState !== 'start') return;
+  updateBgmForStage();
+  gameState = 'play';
+  gameStartedAtT = performance.now();
+}
+
+// クリック（マウス）用：1ボタンしかないので、発射準備ができていれば自動でファイア、
+// そうでなければ噛みつく（従来通りの挙動）
+function triggerBite() {
+  if (gameState === 'start') { startGame(); return; }
+  // スタート操作のクリックは window の pointerdown → canvas の mousedown の順に2回届くため、
+  // 開始直後の噛みつきを誤発動させない
+  if (performance.now() - gameStartedAtT < 300) return;
+  if (gameState === 'gameover' || gameState === 'cleared') { resetGame(); return; }
+  updateBgmForStage();
+  // このアクションの直前の状態を見る。アイテムを取って今まさに fireReady になった場合は
+  // 今回のアクションでは発射せず、次のアクションまで持ち越す
+  const shouldBreathFire = fireReady;
+  if (!shouldBreathFire) doBite();
+  else {
+    biteT = 1;
+    tryBite(); // 噛みつき判定自体は行うが、音は炎の音のみにする
+    doFire();
+  }
+}
+
+// PS5コントローラー ×ボタン：常に「噛みつく」のみ（発射しない）
+function triggerBiteButton() {
+  if (gameState === 'start') { startGame(); return; }
+  if (gameState === 'gameover' || gameState === 'cleared') { resetGame(); return; }
+  updateBgmForStage();
+  doBite();
+}
+
+// PS5コントローラー ○ボタン：発射準備ができているときだけ「炎を吐く」のみ（噛みつかない）
+function triggerFireButton() {
+  if (gameState === 'start') { startGame(); return; }
+  if (gameState === 'gameover' || gameState === 'cleared' || !fireReady) return;
+  updateBgmForStage();
+  doFire();
+}
+
+canvas.addEventListener('mousedown', triggerBite);
+
+// 本物のユーザー操作（クリック/タッチ/キー入力）を検知する共通ハンドラー。
+// ここで初めて音声の再生許可・音量ブーストの初期化が可能になるので、
+// どのタイミングの操作でも必ずBGMの再生を試み直す
+function onRealUserGesture() {
+  hasRealUserGesture = true;
+  if (gameState === 'start') startGame();
+  else updateBgmForStage();
+}
+if (typeof window !== 'undefined' && window.addEventListener) {
+  window.addEventListener('keydown', onRealUserGesture);
+  window.addEventListener('pointerdown', onRealUserGesture);
+}
+
+
+function drawBackground(t) {
+  const idx = clampNum(stage - 1, 0, bgImgs.length - 1);
+  if (bgLoadedFlags[idx]) {
+    bctx.drawImage(bgImgs[idx], bgCropX, 0, bgCropW, BG_NATIVE.h, 0, 0, IW, IH);
+  } else {
+    bctx.fillStyle = '#cfe0d8';
+    bctx.fillRect(0, 0, IW, IH);
+  }
+}
+
+function drawBody() {
+  const useFireBody = isBurning() && fireModeBodyLoaded;
+  if (useFireBody || bodyLoaded) {
+    const bw = BODY_NATIVE.w * BS, bh = BODY_NATIVE.h * BS;
+    bctx.drawImage(useFireBody ? fireModeBodyImg : bodyImg, bodyDrawX, bodyDrawY, bw, bh);
+  }
+}
+
+// 16進カラー同士をratio(0〜1)で線形補間する
+function mixHexColor(hexA, hexB, ratio) {
+  const a = parseInt(hexA.slice(1), 16), b = parseInt(hexB.slice(1), 16);
+  const ar = (a >> 16) & 255, ag = (a >> 8) & 255, ab = a & 255;
+  const br = (b >> 16) & 255, bg = (b >> 8) & 255, bb = b & 255;
+  const r = Math.round(ar + (br - ar) * ratio);
+  const g = Math.round(ag + (bg - ag) * ratio);
+  const bl = Math.round(ab + (bb - ab) * ratio);
+  return `rgb(${r},${g},${bl})`;
+}
+
+function drawPixelNeck(x0, y0, cx, cy, x1, y1, isFireBreathing) {
+  const PIX = 4; // 1ドットあたりの大きさ（低解像度キャンバス基準）
+  const approxLen = Math.hypot(x1 - x0, y1 - y0) + Math.hypot(cx - x0, cy - y0) * 0.3;
+  const steps = Math.max(3, Math.round(approxLen / PIX));
+
+  const baseColA = '#37501b';
+  const baseColB = '#2f4517';
+  const hiCol = '#8a9f5c';
+  const fireColA = '#d1451f';
+  const fireColB = '#b8341a';
+  const fireHiCol = '#ffcf6b';
+
+  for (let i = steps; i >= 0; i--) {
+    const t = i / steps;
+    const mt = 1 - t;
+    const px = mt * mt * x0 + 2 * mt * t * cx + t * t * x1;
+    const py = mt * mt * y0 + 2 * mt * t * cy + t * t * y1;
+    // 根本(t=0)が太く、先端(t=1)に向かって細くなる
+    const size = Math.round(11 - 5 * t);
+    const gx = Math.round(px / PIX) * PIX - size / 2;
+    const gy = Math.round(py / PIX) * PIX - size / 2;
+
+    // 燃えている間はグラデーションにせず首全体を赤にする
+    const fireRatio = isFireBreathing ? 1 : 0;
+    const colA = fireRatio > 0 ? mixHexColor(baseColA, fireColA, fireRatio) : baseColA;
+    const colB = fireRatio > 0 ? mixHexColor(baseColB, fireColB, fireRatio) : baseColB;
+    const hi = fireRatio > 0 ? mixHexColor(hiCol, fireHiCol, fireRatio) : hiCol;
+
+    bctx.fillStyle = (i % 2 === 0) ? colA : colB;
+    bctx.fillRect(gx, gy, size, size);
+    bctx.fillStyle = hi;
+    bctx.fillRect(gx, gy, Math.max(2, size * 0.35), Math.max(2, size * 0.35));
+  }
+}
+
+function drawNeckAndHead(t) {
+  let bitePulse = 0;
+  if (biteT > 0) {
+    bitePulse = Math.sin(Math.min(1, biteT) * Math.PI);
+    biteT -= 0.07;
+    if (biteT < 0) biteT = 0;
+  }
+
+  // マウス方向へのベクトルを計算し、最大リーチでクランプ
+  const mx = mouseHi.x / SCALE, my = mouseHi.y / SCALE;
+  let dx = mx - neckBase.x, dy = my - neckBase.y;
+  let dist = Math.hypot(dx, dy) || 1;
+  const reach = clampNum(dist, NECK_REST, NECK_MAX) + bitePulse * NECK_LUNGE;
+  const dirX = dx / dist, dirY = dy / dist;
+  const targetX = neckBase.x + dirX * reach;
+  const targetY = neckBase.y + dirY * reach;
+
+  // 首の先端をイージングで追従させる
+  headAttach.x += (targetX - headAttach.x) * 0.22;
+  headAttach.y += (targetY - headAttach.y) * 0.22;
+
+  // ---- 首（伸縮するツル・ドット絵風） ----
+  const nx = headAttach.x - neckBase.x, ny = headAttach.y - neckBase.y;
+  const ctrlX = neckBase.x + nx * 0.5 - ny * 0.15;
+  const ctrlY = neckBase.y + ny * 0.5 + nx * 0.15;
+  drawPixelNeck(neckBase.x, neckBase.y, ctrlX, ctrlY, headAttach.x, headAttach.y, isBurning());
+
+  // ---- 頭部（口） ----
+  const angle = Math.atan2(headAttach.y - ctrlY, headAttach.x - ctrlX);
+  const squash = 1 - bitePulse * 0.42; // 噛みつき時にぱくっと潰れる
+
+  bctx.save();
+  bctx.translate(headAttach.x, headAttach.y);
+  bctx.rotate(angle + Math.PI / 2);
+  bctx.scale(1, squash);
+  // 炎を吐ける状態になった瞬間から、吐き終わるまで頭部を燃えている見た目に差し替える
+  const useFireHead = isBurning() && fireModeHeadLoaded;
+  if (useFireHead || headLoaded) {
+    const hw = HEAD_NATIVE.w * BS, hh = HEAD_NATIVE.h * BS;
+    bctx.drawImage(useFireHead ? fireModeHeadImg : headImg, -hw / 2, -hh, hw, hh);
+  }
+  bctx.restore();
+}
+
+function drawFly(f, t) {
+  if (!f.alive) return;
+  const { x: fx, y: fy } = insectPos(f, t);
+  bctx.save();
+  bctx.translate(fx, fy);
+  // 速い個体ほど羽ばたきも速くして、見た目にスピードの個性を出す
+  const flapFreq = 55 - f.speedPxPerSec / 6;
+  const wingFlap = Math.sin(t / flapFreq) * 0.5;
+  bctx.fillStyle = '#ffffffbb';
+  bctx.beginPath(); bctx.ellipse(-3, -1.5, 5, 2.4, 0.4 + wingFlap, 0, Math.PI * 2); bctx.fill();
+  bctx.beginPath(); bctx.ellipse(3, -1.5, 5, 2.4, -0.4 - wingFlap, 0, Math.PI * 2); bctx.fill();
+  bctx.fillStyle = '#222';
+  bctx.beginPath(); bctx.ellipse(0, 0, 3, 2.2, 0, 0, Math.PI * 2); bctx.fill();
+  bctx.restore();
+}
+
+function drawBee(b, t) {
+  if (!b.alive) return;
+  const { x: bx, y: by } = insectPos(b, t);
+  const bw = WASP_BODY_NATIVE.w * WASP_BS, bh = WASP_BODY_NATIVE.h * WASP_BS;
+  const ww = WASP_WINGS_NATIVE.w * WASP_BS, wh = WASP_WINGS_NATIVE.h * WASP_BS;
+  const pivotX = WASP_WING_PIVOT.x * WASP_BS, pivotY = WASP_WING_PIVOT.y * WASP_BS;
+  // 本体・羽で共通の原点（本体中心あたりに合わせるオフセット）
+  const originX = -bw * 0.55, originY = -bh * 0.5;
+
+  bctx.save();
+  bctx.translate(bx, by);
+  bctx.scale(-1, 1); // 右→左に飛ぶので頭が進行方向(左)を向くよう左右反転
+
+  if (waspWingsLoaded) {
+    const flapAngle = Math.sin(t / 55 + b.phase) * 0.5; // 速い周期でパタパタ羽ばたく
+    bctx.save();
+    bctx.translate(originX + pivotX, originY + pivotY);
+    bctx.rotate(flapAngle);
+    bctx.drawImage(waspWingsImg, -pivotX, -pivotY, ww, wh);
+    bctx.restore();
+  }
+  if (waspBodyLoaded) {
+    bctx.drawImage(waspBodyImg, originX, originY, bw, bh);
+  }
+  bctx.restore();
+}
+
+function drawBat(o, t) {
+  if (!o.alive) return;
+  const { x, y } = insectPos(o, t);
+  const bw = BAT_NATIVE.w * BAT_BS, bh = BAT_NATIVE.h * BAT_BS;
+  // 羽ばたき：1枚絵しかないので縦方向のスカッシュで翼が上下するように見せる
+  const flap = 0.72 + 0.28 * Math.abs(Math.sin(t / 90 + o.phase));
+  bctx.save();
+  bctx.translate(x, y);
+  bctx.scale(1, flap);
+  if (batLoaded) {
+    bctx.drawImage(batImg, -bw / 2, -bh / 2, bw, bh);
+  }
+  bctx.restore();
+}
+
+function drawFireOrb(o, t) {
+  if (!o.alive) return;
+  const { x, y } = insectPos(o, t);
+  const pulse = 1 + 0.18 * Math.sin(t / 110);
+  bctx.save();
+  bctx.translate(x, y);
+  bctx.shadowColor = '#ff3b30';
+  bctx.shadowBlur = 8;
+  bctx.fillStyle = '#ff3b30';
+  bctx.beginPath();
+  bctx.arc(0, 0, 6 * pulse, 0, Math.PI * 2);
+  bctx.fill();
+  bctx.shadowBlur = 0;
+  bctx.fillStyle = '#ffb3ad';
+  bctx.beginPath();
+  bctx.arc(-2, -2, 2.2, 0, Math.PI * 2);
+  bctx.fill();
+  bctx.restore();
+}
+
+const STAMINA_HIT_SHAKE_MS = 400; // ダメージを受けた直後にゲージが震える時間
+function drawStaminaHUD(t) {
+  const sinceHit = t - staminaHitT;
+  const shaking = sinceHit < STAMINA_HIT_SHAKE_MS;
+  const shakePower = shaking ? 1 - sinceHit / STAMINA_HIT_SHAKE_MS : 0;
+  const shakeX = shaking ? (Math.random() * 2 - 1) * 3 * shakePower : 0;
+  const shakeY = shaking ? (Math.random() * 2 - 1) * 2 * shakePower : 0;
+
+  // 体力ゲージ（従来よりひとまわり大きく表示）
+  const barX = 6 + shakeX, barY = 8 + shakeY, barW = 92, barH = 10;
+  const ratio = clampNum(stamina / STAMINA_MAX, 0, 1);
+  const normalColor = ratio > 0.5 ? '#7ed957' : ratio > 0.25 ? '#ffcf5c' : '#ff5a5a';
+  bctx.save();
+  bctx.fillStyle = '#00000066';
+  bctx.fillRect(barX - 2, barY - 2, barW + 4, barH + 4);
+  bctx.fillStyle = '#3a2418';
+  bctx.fillRect(barX, barY, barW, barH);
+  bctx.fillStyle = shaking ? mixHexColor(normalColor, '#ff2020', shakePower) : normalColor;
+  bctx.fillRect(barX, barY, barW * ratio, barH);
+  bctx.strokeStyle = '#00000088';
+  bctx.lineWidth = 1;
+  bctx.strokeRect(barX, barY, barW, barH);
+  bctx.restore();
+
+  // ファイアメーター（体力ゲージのすぐ下に配置）
+  const fbX = 6, fbY = barY + barH + 6, fbW = 70, fbH = 7;
+  if (fireReady) {
+    const flash = 0.5 + 0.5 * Math.sin(t / 90);
+    bctx.save();
+    bctx.textAlign = 'left';
+    bctx.textBaseline = 'top';
+    bctx.font = 'bold 10px sans-serif';
+    bctx.fillStyle = `rgba(255,215,0,${0.6 + flash * 0.4})`;
+    bctx.shadowColor = '#ff8c3d';
+    bctx.shadowBlur = 6;
+    bctx.fillText('🔥 FIRE READY', fbX, fbY);
+    bctx.restore();
+  } else {
+    const powerRatio = clampNum(power / POWER_MAX, 0, 1);
+    bctx.save();
+    bctx.fillStyle = '#00000066';
+    bctx.fillRect(fbX - 2, fbY - 2, fbW + 4, fbH + 4);
+    bctx.fillStyle = '#3a2418';
+    bctx.fillRect(fbX, fbY, fbW, fbH);
+    bctx.fillStyle = '#ff8c3d';
+    bctx.fillRect(fbX, fbY, fbW * powerRatio, fbH);
+    bctx.strokeStyle = '#00000088';
+    bctx.lineWidth = 1;
+    bctx.strokeRect(fbX, fbY, fbW, fbH);
+    bctx.restore();
+  }
+}
+
+function drawFire(t) {
+  if (!fireLoaded) return;
+  const fw = FIRE_NATIVE.w * FIRE_BS, fh = FIRE_NATIVE.h * FIRE_BS;
+  for (const f of fireShots) {
+    const life = clampNum((t - f.startT) / FIRE_DURATION, 0, 1);
+    const reach = fireShotReach(f, t); // ゆっくり画面端まで伸びていく（当たり判定と同じ計算）
+    const alpha = 1 - life * 0.6;
+    bctx.save();
+    bctx.globalAlpha = alpha;
+    bctx.translate(f.ox + Math.cos(f.angle) * reach * 0.5, f.oy + Math.sin(f.angle) * reach * 0.5);
+    bctx.rotate(f.angle);
+    bctx.drawImage(fireImg, -fw * 0.15, -fh / 2, fw * (0.4 + reach / FIRE_RANGE * 0.6), fh);
+    bctx.restore();
+  }
+}
+
+const BOSS_SHAKE_MS = 400; // 被弾後にビリビリ震える時間
+
+function drawBoss(t) {
+  if (!boss) return;
+  const { x, y } = bossPos(t);
+  const bw = BOSS_BODY_NATIVE.w * BOSS_BS, bh = BOSS_BODY_NATIVE.h * BOSS_BS;
+  const ww = BOSS_WINGS_NATIVE.w * BOSS_BS, wh = BOSS_WINGS_NATIVE.h * BOSS_BS;
+  const pivotX = BOSS_WING_PIVOT.x * BOSS_BS, pivotY = BOSS_WING_PIVOT.y * BOSS_BS;
+  const originX = -bw * 0.55, originY = -bh * 0.5;
+
+  // 被弾直後は小刻みにビリビリ震える
+  const sinceHit = t - boss.shakeT;
+  let shakeX = 0, shakeY = 0;
+  if (sinceHit < BOSS_SHAKE_MS) {
+    const power = 1 - sinceHit / BOSS_SHAKE_MS;
+    shakeX = (Math.sin(t / 18) * 4) * power;
+    shakeY = (Math.sin(t / 13 + 1) * 3) * power;
+  }
+
+  bctx.save();
+  bctx.translate(x + shakeX, y + shakeY);
+  bctx.scale(-1, 1); // 頭がプレイヤー側(左)を向くよう左右反転
+
+  if (bossWingsLoaded) {
+    const flapAngle = Math.sin(t / 70 + boss.phase) * 0.45; // ゆったり大きめに羽ばたく
+    bctx.save();
+    bctx.translate(originX + pivotX, originY + pivotY);
+    bctx.rotate(flapAngle);
+    bctx.drawImage(bossWingsImg, -pivotX, -pivotY, ww, wh);
+    bctx.restore();
+  }
+  if (bossBodyLoaded) {
+    bctx.drawImage(bossBodyImg, originX, originY, bw, bh);
+  }
+  bctx.restore();
+
+  // ボスのHP表示（残りヒット数）
+  bctx.save();
+  bctx.textAlign = 'center';
+  bctx.textBaseline = 'bottom';
+  bctx.font = '11px sans-serif';
+  bctx.fillStyle = '#ffe08a';
+  bctx.shadowColor = '#000000cc';
+  bctx.shadowBlur = 2;
+  bctx.fillText('🔥'.repeat(boss.hp) + '·'.repeat(BOSS_MAX_HP - boss.hp), x, y - bh / 2 - 4);
+  bctx.restore();
+}
+
+// 画面右上：スコアとステージ進行状況
+function drawTopRightHUD() {
+  bctx.save();
+  bctx.textAlign = 'right';
+  bctx.textBaseline = 'top';
+  bctx.shadowColor = '#000000cc';
+  bctx.shadowBlur = 2;
+
+  bctx.font = 'bold 13px sans-serif';
+  bctx.fillStyle = '#ffe08a';
+  bctx.fillText(`SCORE ${score}`, IW - 6, 6);
+
+  bctx.font = '10px sans-serif';
+  bctx.fillStyle = '#fff3d6';
+  const stageLabel = stage >= STAGE_MAX
+    ? `STAGE ${stage}`
+    : `STAGE ${stage}　あと${Math.max(0, stageGoal - stageProgress)}`;
+  bctx.fillText(stageLabel, IW - 6, 21);
+
+  bctx.restore();
+}
+
+// 画面下：ネック長ゲージ
+function drawBottomHUD(t) {
+  const mx = mouseHi.x / SCALE, my = mouseHi.y / SCALE;
+  const aimDist = Math.hypot(mx - neckBase.x, my - neckBase.y);
+  const neckRatio = clampNum(aimDist / NECK_MAX, 0, 1);
+
+  const barW = 60, barH = 6;
+  const nbX = 6, nbY = IH - 12;
+  bctx.save();
+  bctx.fillStyle = '#00000066';
+  bctx.fillRect(nbX - 2, nbY - 2, barW + 4, barH + 4);
+  bctx.fillStyle = '#21301a';
+  bctx.fillRect(nbX, nbY, barW, barH);
+  bctx.fillStyle = '#8fd66a';
+  bctx.fillRect(nbX, nbY, barW * neckRatio, barH);
+  bctx.strokeStyle = '#00000088';
+  bctx.lineWidth = 1;
+  bctx.strokeRect(nbX, nbY, barW, barH);
+  bctx.restore();
+}
+
+function drawSpider(s) {
+  if (!s.alive) return;
+  bctx.save();
+  bctx.translate(s.baseX, s.baseY);
+  // 脚（8本・警戒色の赤みがかった黒）
+  bctx.strokeStyle = '#1a1210';
+  bctx.lineWidth = 1;
+  for (let i = 0; i < 4; i++) {
+    const a = -0.55 + i * 0.4;
+    bctx.beginPath(); bctx.moveTo(0, -0.5); bctx.lineTo(Math.cos(Math.PI - a) * 6.5, -0.5 + Math.sin(a) * 5); bctx.stroke();
+    bctx.beginPath(); bctx.moveTo(0, -0.5); bctx.lineTo(Math.cos(a) * 6.5, -0.5 + Math.sin(a) * 5); bctx.stroke();
+  }
+  // 胴体
+  bctx.fillStyle = '#1a1210';
+  bctx.beginPath(); bctx.ellipse(0, -2.2, 2.6, 2.2, 0, 0, Math.PI * 2); bctx.fill();
+  bctx.beginPath(); bctx.ellipse(0, 1.6, 4, 3.4, 0, 0, Math.PI * 2); bctx.fill();
+  // 背中の警告マーク（毒々しい赤の砂時計模様）
+  bctx.fillStyle = '#c0392b';
+  bctx.beginPath();
+  bctx.moveTo(0, -0.2); bctx.lineTo(1.6, 1.6); bctx.lineTo(0, 3.6); bctx.lineTo(-1.6, 1.6);
+  bctx.closePath(); bctx.fill();
+  bctx.restore();
+}
+
+function loop(t) {
+  const dt = lastFrameT != null ? (t - lastFrameT) : 16;
+  lastFrameT = t;
+
+  // ボス登場演出中(最初の2秒)は敵mob・ファイアボール・ハエなどを非表示にし、ボスの登場だけを見せる
+  const bossIntroActive = !!boss && t < boss.introUntil;
+
+  if (gameState === 'play') updateCharacterMovement(t);
+
+  pollGamepad();
+
+  // 画面外まで飛びきった虫（ハエ・ハチ・アイテム）は右端から再度飛んでこさせる
+  // （アイテムは使い切りなので、外に出たら消えて次のタイマーで新しく出現させる）
+  for (const o of insects) {
+    if (KIND_INFO[o.type].flying && o.alive) {
+      const p = insectPos(o, t);
+      if (p.x < -40) {
+        if (o.type === 'fireOrb') o.alive = false;
+        else resetFlyingInsect(o, t, o.type);
+      }
+    }
+  }
+  if (insects.some(o => o.type === 'fireOrb' && !o.alive)) {
+    insects = insects.filter(o => !(o.type === 'fireOrb' && !o.alive));
+  }
+
+  // 火炎ブレスのアイテム（赤い●）を約4秒に1回出現させる。
+  // ラストステージはボス戦がすぐ終わってしまわないよう、出現率をさらに半分に落とす
+  // （ボス登場演出中は新規出現を止め、演出明けから改めてカウントする）
+  if (gameState === 'play' && !bossIntroActive) {
+    orbSpawnTimer -= dt;
+    if (orbSpawnTimer <= 0) {
+      insects.push(makeFireOrb());
+      const base = 3500 + Math.random() * 1000;
+      orbSpawnTimer = stage >= STAGE_MAX ? base * 0.75 : base;
+    }
+  }
+
+  // ハチ・コウモリはクリックしなくても触れるだけでダメージ
+  if (gameState === 'play' && !bossIntroActive) checkFlyingHazardContact(t);
+
+  // ボスの突進アニメーションを更新（登場演出中は突進しない）
+  if (gameState === 'play' && !bossIntroActive) updateBossDash(t);
+  if (gameState === 'play' && !bossIntroActive) checkBossContact(t);
+
+  // 炎に当たった敵の判定を更新し、しびれて落下しきった敵を後片付けする
+  if (gameState === 'play' && !bossIntroActive) {
+    updateFire(t);
+    for (const o of insects) {
+      if (o.stunned && o.alive) {
+        const p = insectPos(o, t);
+        if (p.y > IH + 20) {
+          o.alive = false;
+          o.stunned = false;
+          scheduleRespawn(o, 900 + Math.random() * 600);
+        }
+      }
+    }
+  }
+
+  // 体力ゲージは時間経過で少しずつ減り、尽きるとゲームオーバーになる
+  if (gameState === 'play') {
+    stamina -= (STAMINA_MAX / STAMINA_DRAIN_MS) * dt;
+    if (stamina <= 0) {
+      stamina = 0;
+      gameState = 'gameover';
+    }
+  }
+
+  bctx.clearRect(0, 0, IW, IH);
+  drawBackground(t);
+  drawBody();
+  drawNeckAndHead(t);
+  drawBoss(t);
+
+  // ボス登場演出：画面をわずかに暗くしつつ、鼓動のような赤い明滅で緊張感を出す
+  if (bossIntroActive) {
+    const introP = clampNum((t - boss.introStartT) / BOSS_INTRO_MS, 0, 1);
+    const pulse = 0.25 + 0.2 * Math.sin(t / 90);
+    bctx.fillStyle = `rgba(10,0,0,${0.35 * (1 - introP * 0.4)})`;
+    bctx.fillRect(0, 0, IW, IH);
+    bctx.fillStyle = `rgba(200,30,10,${pulse * (1 - introP)})`;
+    bctx.fillRect(0, 0, IW, IH);
+  }
+
+  // 虫は常にキャラクターより手前（最前面）に描画する（ボス登場演出中は非表示）
+  if (!bossIntroActive) {
+    for (const o of insects) {
+      if (o.type === 'fly') drawFly(o, t);
+      else if (o.type === 'bee') drawBee(o, t);
+      else if (o.type === 'bat') drawBat(o, t);
+      else if (o.type === 'fireOrb') drawFireOrb(o, t);
+      else if (o.type === 'spider') drawSpider(o);
+    }
+  }
+
+  drawFire(t);
+
+  if (hitFlash > 0) {
+    bctx.fillStyle = `rgba(220,20,20,${hitFlash * 0.65})`;
+    bctx.fillRect(0, 0, IW, IH);
+    hitFlash -= 0.05;
+  }
+
+  if (toast) {
+    bctx.save();
+    bctx.globalAlpha = clampNum(toast.timer / 20, 0, 1);
+    bctx.fillStyle = '#000000aa';
+    bctx.fillRect(IW / 2 - 70, 14, 140, 22);
+    bctx.fillStyle = '#ffe08a';
+    bctx.font = 'bold 12px sans-serif';
+    bctx.textAlign = 'center';
+    bctx.fillText(toast.text, IW / 2, 30);
+    bctx.restore();
+    toast.timer -= 1;
+    if (toast.timer <= 0) toast = null;
+  }
+
+  if (gameState === 'start') {
+    bctx.fillStyle = '#000000aa';
+    bctx.fillRect(0, 0, IW, IH);
+    bctx.font = 'bold 16px sans-serif';
+    bctx.textAlign = 'center';
+    bctx.fillStyle = '#ffe6ae';
+    bctx.fillText('🌱 ハエトリソウの脱出', IW / 2, IH / 2 - 14);
+    bctx.font = '11px sans-serif';
+    bctx.fillText('画面をクリックしてスタート', IW / 2, IH / 2 + 8);
+    bctx.font = '9px sans-serif';
+    bctx.fillStyle = '#d8c79a';
+    bctx.fillText('（BGMを鳴らすため、コントローラーの方も最初の1回だけクリックしてください）', IW / 2, IH / 2 + 24);
+  }
+
+  if (gameState === 'gameover' || gameState === 'cleared') {
+    bctx.fillStyle = '#000000aa';
+    bctx.fillRect(0, 0, IW, IH);
+    bctx.font = 'bold 20px sans-serif';
+    bctx.textAlign = 'center';
+    bctx.fillStyle = gameState === 'cleared' ? '#9dffb0' : '#ffe6ae';
+    bctx.fillText(gameState === 'cleared' ? '🎉 GAME CLEAR 🎉' : 'GAME OVER', IW / 2, IH / 2 - 6);
+    bctx.font = '11px sans-serif';
+    bctx.fillStyle = '#ffe6ae';
+    bctx.fillText('クリックでリスタート', IW / 2, IH / 2 + 14);
+  }
+
+  drawStaminaHUD(t);
+  drawTopRightHUD();
+  drawBottomHUD(t);
+
+  ctx.clearRect(0, 0, W, H);
+  ctx.drawImage(buf, 0, 0, IW, IH, 0, 0, W, H);
+
+  updateDebugStatus();
+
+  requestAnimationFrame(loop);
+}
+requestAnimationFrame(loop);
+</script>
+</body>
+</html>
